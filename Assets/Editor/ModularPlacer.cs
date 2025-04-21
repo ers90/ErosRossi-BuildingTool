@@ -1,10 +1,15 @@
-﻿using System.Linq;
-using UnityEditor;
+﻿using UnityEditor;
 using UnityEngine;
 
 [InitializeOnLoad]
 public static class ModularPlacer
 {
+    // cache delle layer/mask e del MaterialPropertyBlock
+    private static readonly int IgnoreRaycastLayer = LayerMask.NameToLayer("Ignore Raycast");
+    private static readonly int IgnoreRaycastMask = ~LayerMask.GetMask("Ignore Raycast");
+    private static readonly int PlacedLayer = LayerMask.NameToLayer("PlacedModule");
+    private static readonly MaterialPropertyBlock s_Block = new MaterialPropertyBlock();
+
     private static Quaternion currentRotation = Quaternion.identity;
     private static bool placingActive = false;
     private static GameObject previewInstance;
@@ -12,11 +17,17 @@ public static class ModularPlacer
 
     private static int currentFloor = 0;
     private static float floorHeight = 2.0001f;
-    //private static float floorOffset = 0.01f; // Nuovo offset per i piani superiori
+    public static string placementError = "";
 
     static ModularPlacer()
     {
         SceneView.duringSceneGui += OnSceneGUI;
+    }
+
+    // per sloggare l'evento quando gli script vengono disabilitati/richiusi
+    public static void OnDisable()
+    {
+        SceneView.duringSceneGui -= OnSceneGUI;
     }
 
     public static int CurrentFloor
@@ -35,12 +46,11 @@ public static class ModularPlacer
             Object.DestroyImmediate(previewInstance);
 
         previewInstance = Object.Instantiate(prefabToPlace);
-        previewInstance.layer = LayerMask.NameToLayer("Ignore Raycast");
-
-        foreach (Transform child in previewInstance.transform)
-            child.gameObject.layer = LayerMask.NameToLayer("Ignore Raycast");
-
+        previewInstance.layer = IgnoreRaycastLayer;
+        foreach (var t in previewInstance.GetComponentsInChildren<Transform>())
+            t.gameObject.layer = IgnoreRaycastLayer;
         previewInstance.hideFlags = HideFlags.HideAndDontSave;
+
         EditorApplication.update += DelayedActivatePlacing;
     }
 
@@ -54,75 +64,69 @@ public static class ModularPlacer
 
     private static void OnSceneGUI(SceneView sceneView)
     {
-        if (!placingActive || prefabToPlace == null)
+        if (!placingActive || prefabToPlace == null || previewInstance == null)
             return;
 
-        if (previewInstance == null)
-        {
-            CancelPlacement();
-            return;
-        }
-
-        Event e = Event.current;
+        var e = Event.current;
         HandleInput(e);
+        if (!placingActive || previewInstance == null)
+            return;
 
-        Plane groundPlane = new(Vector3.up, Vector3.zero);
-        Ray ray = HandleUtility.GUIPointToWorldRay(e.mousePosition);
+        var plane = new Plane(Vector3.up, Vector3.zero);
+        var ray = HandleUtility.GUIPointToWorldRay(e.mousePosition);
+        if (!plane.Raycast(ray, out var enter))
+            return;
 
-        if (groundPlane.Raycast(ray, out float enter))
+        var point = ray.GetPoint(enter);
+        var position = GetSnappedPosition(point);
+        var valid = CanPlaceHere(position, currentRotation);
+
+        previewInstance.transform.SetPositionAndRotation(position, currentRotation);
+        SetPreviewColor(previewInstance, valid
+            ? new Color(0, 1, 0, 0.5f)
+            : new Color(1, 0, 0, 0.5f)
+        );
+
+        if (e.type == EventType.MouseDown && e.button == 0)
         {
-            Vector3 point = ray.GetPoint(enter);
-            Vector3 position = SnapPosition(point);
-            bool isValid = IsPositionValid(position, currentRotation);
-
-            previewInstance.transform.SetPositionAndRotation(position, currentRotation);
-            SetPreviewColor(previewInstance, isValid ? new Color(0, 1, 0, 0.5f) : new Color(1, 0, 0, 0.5f));
-
-            if (e.type == EventType.MouseDown && e.button == 0)
-            {
-                if (isValid)
-                    PlaceObject(position, currentRotation);
-                else
-                    Debug.Log("Posizione non valida: modulo sovrapposto!");
-
-                e.Use();
-            }
-
-            sceneView.Repaint();
+            if (valid)
+                PlaceObject(position, currentRotation);
+            else
+                Debug.Log(placementError);
+            e.Use();
         }
+
+        sceneView.Repaint();
     }
 
     private static void HandleInput(Event e)
     {
-        if (e.type == EventType.KeyDown)
+        if (e.type != EventType.KeyDown) return;
+
+        switch (e.keyCode)
         {
-            if (e.keyCode == KeyCode.Z)
-            {
+            case KeyCode.Z:
                 currentRotation *= Quaternion.Euler(0, -90, 0);
                 e.Use();
-            }
-            else if (e.keyCode == KeyCode.X)
-            {
+                break;
+            case KeyCode.X:
                 currentRotation *= Quaternion.Euler(0, 90, 0);
                 e.Use();
-            }
-            else if (e.keyCode == KeyCode.PageUp)
-            {
+                break;
+            case KeyCode.PageUp:
                 currentFloor++;
-                Debug.Log($"🔼 Piano attivo: {currentFloor}");
+                Debug.Log($"🔼 Active floor: {currentFloor}");
                 e.Use();
-            }
-            else if (e.keyCode == KeyCode.PageDown)
-            {
+                break;
+            case KeyCode.PageDown:
                 currentFloor = Mathf.Max(0, currentFloor - 1);
-                Debug.Log($"🔽 Piano attivo: {currentFloor}");
+                Debug.Log($"🔽 Active floor: {currentFloor}");
                 e.Use();
-            }
-            else if (e.keyCode == KeyCode.Escape)
-            {
+                break;
+            case KeyCode.Escape:
                 CancelPlacement();
                 e.Use();
-            }
+                break;
         }
     }
 
@@ -140,81 +144,83 @@ public static class ModularPlacer
 
     private static void PlaceObject(Vector3 position, Quaternion rotation)
     {
-        GameObject placed = PrefabUtility.InstantiatePrefab(prefabToPlace) as GameObject;
+        var placed = PrefabUtility.InstantiatePrefab(prefabToPlace) as GameObject;
         placed.transform.SetPositionAndRotation(position, rotation);
-
-        int placedLayer = LayerMask.NameToLayer("PlacedModule");
-        if (placedLayer == -1)
-        {
-            Debug.LogWarning("Layer 'PlacedModule' not found. Please add it under Tags and Layers.");
-            placedLayer = 0;
-        }
-
-        placed.layer = placedLayer;
-        foreach (Transform child in placed.transform)
-            child.gameObject.layer = placedLayer;
+        placed.layer = PlacedLayer;
+        foreach (var t in placed.GetComponentsInChildren<Transform>())
+            t.gameObject.layer = PlacedLayer;
 
         Undo.RegisterCreatedObjectUndo(placed, "Place Modular Piece");
     }
 
-    private static Vector3 SnapPosition(Vector3 rawPos)
+    private static Vector3 GetSnappedPosition(Vector3 rawPos)
     {
-        Bounds bounds = GetPrefabBounds(prefabToPlace);
-        Vector3 size = currentRotation * bounds.size;
+        var bounds = GetPrefabBounds(prefabToPlace);
+        var size = currentRotation * bounds.size;
         size = new Vector3(Mathf.Abs(size.x), Mathf.Abs(size.y), Mathf.Abs(size.z));
 
-        float snapX = Mathf.Round(rawPos.x / size.x) * size.x;
-        float snapZ = Mathf.Round(rawPos.z / size.z) * size.z;
+        float x = Mathf.Round(rawPos.x / size.x) * size.x;
+        float z = Mathf.Round(rawPos.z / size.z) * size.z;
+        float y = currentFloor * floorHeight;
 
-        // Calcola l'altezza del piano attivo con offset per i piani superiori
-        float snapY = currentFloor * floorHeight;
-        // 🔧 Se è un corner, fai snap su 0.05
-        if (prefabToPlace.name.ToLower().Contains("Corner"))
+        if (prefabToPlace != null && prefabToPlace.name.ToLower().Contains("corner"))
         {
-            snapX = Mathf.Round(rawPos.x * 10f) / 10f;
-            snapZ = Mathf.Round(rawPos.z * 10f) / 10f;
+            x = Mathf.Round(rawPos.x * 10f) / 10f;
+            z = Mathf.Round(rawPos.z * 10f) / 10f;
         }
 
-        return new Vector3(snapX, snapY, snapZ);
+        return new Vector3(x, y, z);
     }
 
-    private static bool IsPositionValid(Vector3 position, Quaternion rotation)
+    private static bool CanPlaceHere(Vector3 position, Quaternion rotation)
     {
-        if (prefabToPlace == null) return false;
+        if (prefabToPlace == null)
+        {
+            placementError = "No prefab selected";
+            return false;
+        }
 
-        Bounds bounds = GetPrefabBounds(prefabToPlace);
-        Vector3 center = position + rotation * bounds.center;
-        Vector3 halfExtents = bounds.extents - Vector3.one * 0.02f;
+        if (prefabToPlace.name.Contains("Roof") && currentFloor == 0)
+        {
+            placementError = "The roof can only be placed starting from the first floor";
+            return false;
+        }
 
-        int layerMask = ~LayerMask.GetMask("Ignore Raycast");
-        Collider[] colliders = Physics.OverlapBox(center, halfExtents, rotation, layerMask);
-        return colliders.Length == 0;
+        var bounds = GetPrefabBounds(prefabToPlace);
+        var center = position + rotation * bounds.center;
+        var halfExtents = bounds.extents - Vector3.one * 0.02f;
+
+        var hits = Physics.OverlapBox(center, halfExtents, rotation, IgnoreRaycastMask);
+        if (hits.Length > 0)
+        {
+            placementError = "Position not valid: you can't stack on top of other modules!";
+            return false;
+        }
+
+        placementError = "";
+        return true;
     }
 
     private static Bounds GetPrefabBounds(GameObject prefab)
     {
-        Renderer[] renderers = prefab.GetComponentsInChildren<Renderer>();
-        if (renderers.Length == 0)
+        if (prefab == null)
             return new Bounds(Vector3.zero, Vector3.one);
 
-        Bounds combined = renderers[0].bounds;
-        foreach (Renderer r in renderers)
-            combined.Encapsulate(r.bounds);
+        var renders = prefab.GetComponentsInChildren<Renderer>();
+        if (renders.Length == 0)
+            return new Bounds(prefab.transform.position, Vector3.one);
 
-        return combined;
+        var b = renders[0].bounds;
+        foreach (var r in renders)
+            b.Encapsulate(r.bounds);
+        return b;
     }
 
     private static void SetPreviewColor(GameObject obj, Color color)
     {
-        foreach (var renderer in obj.GetComponentsInChildren<Renderer>())
-        {
-            if (renderer != null)
-            {
-                MaterialPropertyBlock block = new();
-                renderer.GetPropertyBlock(block);
-                block.SetColor("_Color", color);
-                renderer.SetPropertyBlock(block);
-            }
-        }
+        s_Block.SetColor("_Color", color);
+        foreach (var r in obj.GetComponentsInChildren<Renderer>())
+            if (r != null)
+                r.SetPropertyBlock(s_Block);
     }
 }
